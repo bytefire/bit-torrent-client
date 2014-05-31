@@ -10,6 +10,7 @@
 #include<netinet/in.h>
 #include<arpa/inet.h>
 #include<sys/time.h>
+#include<pthread.h>
 
 #include "bencode.h"
 #include "util.h"
@@ -43,6 +44,7 @@
 
 #define SAVED_FILE_PATH "../../files/loff.savedfile"
 #define LOG_FILE "logs/pwp.log"
+#define MAX_THREADS 4
 
 struct pwp_peer
 {
@@ -51,9 +53,15 @@ struct pwp_peer
 	int has_pieces;
 };
 
-struct pwp_piece
+struct pwp_peer_node // node for linked list of peers
 {
 	struct pwp_peer *peer;
+	struct pwp_peer_node *next;
+};
+
+struct pwp_piece
+{
+	struct pwp_peer_node *peers; // this is the HEAD pointer
 	uint8_t status;
 };
 
@@ -64,17 +72,36 @@ struct pwp_block
     uint8_t status;
 };
 
-struct pwp_piece *pieces = NULL;
-long int piece_length = -1;
-long int num_of_pieces = -1;
-FILE *savedfp = NULL;
+struct talk_to_peer_args
+{
+    uint8_t *info_hash;
+    uint8_t *our_peer_id;
+    char *ip;
+    uint16_t port;
+};
+
+struct thread_data
+{
+	struct talk_to_peer_args *args;
+	pthread_t thread_descriptor;
+};
+
+struct pwp_piece *g_pieces = NULL;
+long int g_piece_length = -1;
+long int g_num_of_pieces = -1;
+FILE *g_savedfp = NULL;
+long int g_downloaded_pieces = 0;
+
+pthread_mutex_t *g_pieces_mutexes = NULL;
+pthread_mutex_t g_savedfp_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t g_downloaded_pieces_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 uint8_t *compose_handshake(uint8_t *info_hash, uint8_t *our_peer_id, int *len);
 uint8_t *compose_interested(int *len);
 uint8_t *compose_request(int piece_idx, int block_offset, int block_length, int *len);
 
 uint8_t extract_msg_id(uint8_t *response);
-int talk_to_peer(uint8_t *info_hash, uint8_t *our_peer_id, char *ip, uint16_t port);
+void *talk_to_peer(void *args);
 
 int receive_msg(int socketfd, fd_set *recvfd, uint8_t **msg, int *len);
 int receive_msg_hs(int socketfd, fd_set *recvfd, uint8_t **msg, int *len);
@@ -84,9 +111,13 @@ int process_msgs(uint8_t *msgs, int len, int has_hs, struct pwp_peer *peer);
 int receive_msg_for_len(int socketfd, fd_set *recvfd, int len, uint8_t *msg);
 int process_have(uint8_t *msg, struct pwp_peer *peer);
 int process_bitfield(uint8_t *msg, struct pwp_peer *peer); 
-int choose_random_piece_idx();
+int choose_random_piece_idx(uint8_t *peer_id);
+int are_same_peers(uint8_t *peer_id1, uint8_t *peer_id2);
+void linked_list_add(struct pwp_peer_node **head, struct pwp_peer *peer);
+int linked_list_contains_peer_id(struct pwp_peer_node *head, uint8_t *peer_id);
+void linked_list_free(struct pwp_peer_node **head);
 int get_pieces(int socketfd, struct pwp_peer *peer);
-int download_piece(int idx, int socketfd, struct pwp_peer *peer);
+int download_block(int socketfd, int expected_piece_idx, struct pwp_block *block, struct pwp_peer *peer);
 uint8_t *prepare_requests(int piece_idx, struct pwp_block *blocks, int num_of_blocks, int max_requests, int *len);
 int download_block(int socketfd, int expected_piece_idx, struct pwp_block *block, struct pwp_peer *peer);
 
@@ -97,7 +128,7 @@ bf_log("++++++++++++++++++++ START:  PWP_START +++++++++++++++++++++++\n");
 
 	uint8_t *metadata;
 	const char *str;
-	int len;
+	int len, i;
 	long int num;
 	int rv = 0;
 	bencode_t b1, b2, b3, b4; // bn where n is the level of nestedness
@@ -142,9 +173,14 @@ bf_log("++++++++++++++++++++ START:  PWP_START +++++++++++++++++++++++\n");
                 bf_log(  "Failed to find 'num_of_pieces' in metadata file.\n");
                 goto cleanup;
         }
-        bencode_int_value(&b2, &num_of_pieces);
-	pieces = malloc(sizeof(struct pwp_piece) * num_of_pieces);
-	bzero(pieces, sizeof(struct pwp_piece) * num_of_pieces);
+        bencode_int_value(&b2, &g_num_of_pieces);
+	g_pieces = malloc(sizeof(struct pwp_piece) * g_num_of_pieces);
+	bzero(g_pieces, sizeof(struct pwp_piece) * g_num_of_pieces);
+	g_pieces_mutexes = malloc(sizeof(pthread_mutex_t) * g_num_of_pieces);
+	for(i=0; i<g_num_of_pieces; i++)
+	{
+		 pthread_mutex_init(&g_pieces_mutexes[i], NULL);
+	}
 
 	bencode_dict_get_next(&b1, &b2, &str, &len);
         if(strncmp(str, "piece_length", 12) != 0)
@@ -153,10 +189,10 @@ bf_log("++++++++++++++++++++ START:  PWP_START +++++++++++++++++++++++\n");
                 bf_log(  "Failed to find 'piece_length' in metadata file.\n");
                 goto cleanup;
         }
-        bencode_int_value(&b2, &piece_length);
+        bencode_int_value(&b2, &g_piece_length);
 	// TODO: create a file whose size is num_of_pieces * piece_length        
-	savedfp = util_create_file_of_size(SAVED_FILE_PATH, num_of_pieces * piece_length);
-	if(!savedfp)
+	g_savedfp = util_create_file_of_size(SAVED_FILE_PATH, g_num_of_pieces * g_piece_length);
+	if(!g_savedfp)
 	{
 		bf_log(  "[ERROR] pwp_start(): Failed to create saved file. Aborting.\n");
 		rv = -1;
@@ -172,42 +208,88 @@ bf_log("++++++++++++++++++++ START:  PWP_START +++++++++++++++++++++++\n");
         }
 
 /********** begining of what will be a while loop for every peer ******************/
-	while(bencode_list_has_next(&b2))
-	{	
-		bencode_list_get_next(&b2, &b3);
-	
-		// this is a peer in b3 now. b3 is a dictionary.
-		bencode_dict_get_next(&b3, &b4, &str, &len);
-        	if(strncmp(str, "ip", 2) != 0)
-       		{
-                	rv = -1;
-                	bf_log(  "Failed to find 'ip' in metadata file.\n");
-                	goto cleanup;
-        	}
-        	bencode_string_value(&b4, &str, &len);
-		ip = malloc(len + 1); // +1 is to leave space for null terminator char
-		memcpy(ip, str, len);
-		ip[len] = '\0';
+	struct talk_to_peer_args *args;
+	pthread_t thread1;
+	int t1_rv, thread_count;
+	void *ttp_rv;
+	struct thread_data *td = malloc(MAX_THREADS * sizeof(struct thread_data));
 
-		bencode_dict_get_next(&b3, &b4, &str, &len);
-	        if(strncmp(str, "port", 4) != 0)
-       		{
-        	        rv = -1;
-	                bf_log(  "Failed to find 'port' in metadata file.\n");
-                	goto cleanup;
-        	}
-       		bencode_int_value(&b4, &num);
-		port = (uint16_t)num;
+	thread_count = 0;
+	while((extract_next_peer(&b2, &ip, &port) == 0) && (thread_count < MAX_THREADS))
+	{	
+		args = malloc(sizeof(struct talk_to_peer_args));
+		args->info_hash = info_hash;
+		args->our_peer_id = our_peer_id;
+		args->ip = ip;
+		args->port = port;
+		t1_rv = pthread_create(&thread1, NULL, talk_to_peer, (void *)args);
 		
-		bf_log("*** Going to process peer: %s:%d\n", ip, port);
-		rv = talk_to_peer(info_hash, our_peer_id, ip, port);
+		td[thread_count].args = args;
+		td[thread_count].thread_descriptor = thread1;
 		
-		bf_log("[LOG] pwp_start: rv from talk_to_peer is %d.\n\n", rv);
-		if(rv == 0)
+		thread_count++;
+	}
+
+	rv = -1;
+	
+	int count = 0;
+	struct timespec ts;
+	while(count < 3)
+	{
+		// this for loop goes over each thread checking if it has completed. 
+		for(thread_count = 0; thread_count < MAX_THREADS; thread_count++)
 		{
-			break;
+			clock_gettime(CLOCK_REALTIME, &ts);
+        	        ts.tv_sec += 1;
+	                rv = pthread_timedjoin_np(td[thread_count].thread_descriptor, &ttp_rv, &ts);
+			if(rv == 0) // rv == 0 means that the thread completed execution
+			{
+				// 1. free resources
+				bf_log("[LOG] pwp_start: >>> Thread Completed <<< rv from talk_to_peer thread no: %d is %d.\n\n", thread_count, (int)ttp_rv);
+				free(td[thread_count].args);
+				td[thread_count].args = NULL;
+
+				// 2. start new thread in its place
+				if(extract_next_peer(&b2, &ip, &port) == 0)
+			        {
+		                	args = malloc(sizeof(struct talk_to_peer_args));
+        		        	args->info_hash = info_hash;
+                			args->our_peer_id = our_peer_id;
+	        		        args->ip = ip;
+        		        	args->port = port;
+	               		 	t1_rv = pthread_create(&thread1, NULL, talk_to_peer, (void *)args);
+		
+			                td[thread_count].args = args;
+                			td[thread_count].thread_descriptor = thread1;
+				}
+                	}
+        	}
+	
+		
+
+
+		/* -X-X-X- CRITICAL REGION START -X-X-X- */
+		pthread_mutex_lock(&g_downloaded_pieces_mutex);
+	
+		count = g_downloaded_pieces;
+
+		pthread_mutex_unlock(&g_downloaded_pieces_mutex);
+		/* -X-X-X- CRITICAL REGION END -X-X-X- */
+	}
+	bf_log("[LOG] Finished the while loop to download at least 3 pieces.\n");
+		
+	// Final for-loop to ensure that all the threads have joined
+	for(thread_count = 0; thread_count < MAX_THREADS; thread_count++)
+	{
+		pthread_join(td[thread_count].thread_descriptor, NULL);
+		if(td[thread_count].args)
+		{
+			free(td[thread_count].args);
+			td[thread_count].args = NULL;
 		}
 	}
+
+	free(td);
 /********** end of what will be while loop for every peer ****************/
 
 cleanup:
@@ -222,16 +304,79 @@ cleanup:
 		bf_log("[LOG] Freeing IP.\n");
 		free(ip);
 	}
-	if(savedfp)
+	if(g_savedfp)
 	{
-		bf_log("[LOG] pwp_start(): Closing savedfp.\n");
-		fclose(savedfp);
+		bf_log("[LOG] pwp_start(): Closing g_savedfp.\n");
+		fclose(g_savedfp);
+	}
+	if(g_pieces)
+	{
+		bf_log("[LOG] pwp_start: before freeing g_pieces, freeing linked lists of peers inside each piece.\n");
+		for(i=0; i<g_num_of_pieces; i++)
+		{
+			linked_list_free(&g_pieces[i].peers);
+		}
+		bf_log("[LOG] pwp_start: freeing g_pieces.\n");
+		free(g_pieces);
+	}
+	if(g_pieces_mutexes)
+	{
+		bf_log("[LOG] pwp_start: freeing g_pieces_mutexes.\n");
+		free(g_pieces_mutexes);
 	}
 	bf_logger_end();
 	return rv;	
 }
 
-int talk_to_peer(uint8_t *info_hash, uint8_t *our_peer_id, char *ip, uint16_t port)
+int extract_next_peer(bencode_t *list_of_peers, char **ip, uint16_t *port)
+{
+	bf_log("++++++++++++++++++++ START:  EXTRACT_NEXT_PEER +++++++++++++++++++++++\n");
+	int rv = 0;
+	bencode_t b1, b2;
+	const char *str;
+        int len;
+        long int num;
+	
+	if(!bencode_list_has_next(list_of_peers))
+        {
+		bf_log("[LOG] extract_next_peer: no more peers.\n");
+		rv = -1;
+		goto cleanup;
+	}
+        
+	bencode_list_get_next(list_of_peers, &b1);
+
+        // this is a peer in b1 now and b1 is a dictionary.
+        bencode_dict_get_next(&b1, &b2, &str, &len);
+        if(strncmp(str, "ip", 2) != 0)
+        {
+		rv = -1;
+                bf_log("[LOG] Failed to find 'ip' in metadata file.\n");
+                goto cleanup;
+        }
+        bencode_string_value(&b2, &str, &len);
+        *ip = malloc(len + 1); // +1 is to leave space for null terminator char
+        memcpy(*ip, str, len);
+        (*ip)[len] = '\0';
+
+        bencode_dict_get_next(&b1, &b2, &str, &len);
+        if(strncmp(str, "port", 4) != 0)
+        {
+		rv = -1;
+                bf_log(  "Failed to find 'port' in metadata file.\n");
+                goto cleanup;
+        }
+        bencode_int_value(&b2, &num);
+        *port = (uint16_t)num;
+
+cleanup:
+	bf_log(" ------------------------------------ FINISH: EXTRACT_NEXT_PEER ----------------------------------------\n");
+	return rv;
+
+}
+
+// int talk_to_peer(uint8_t *info_hash, uint8_t *our_peer_id, char *ip, uint16_t port)
+void *talk_to_peer(void *args)
 {
 	bf_log("++++++++++++++++++++ START:  TALK_TO_PEER +++++++++++++++++++++++\n");
 
@@ -247,15 +392,19 @@ int talk_to_peer(uint8_t *info_hash, uint8_t *our_peer_id, char *ip, uint16_t po
 	int msg_len;	
 	uint8_t *recvd_msg = NULL;
 	struct pwp_peer peer_status;
-	
+
+	struct talk_to_peer_args *ttp_args = (struct talk_to_peer_args *)args;	
+
+	bf_log("*** Going to process peer: %s:%d\n", ttp_args->ip, ttp_args->port);
+
 	peer_status.unchoked = 0;
 	peer_status.has_pieces = 0;
 	rv = 0;
 	FD_ZERO(&recvfd);
 
-	hs = compose_handshake(info_hash, our_peer_id, &hs_len);
+	hs = compose_handshake(ttp_args->info_hash, ttp_args->our_peer_id, &hs_len);
 	
-	peer_port = htons(port);
+	peer_port = htons(ttp_args->port);
 	if((socketfd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
 	{
 		perror("socket");
@@ -268,7 +417,7 @@ int talk_to_peer(uint8_t *info_hash, uint8_t *our_peer_id, char *ip, uint16_t po
 	bzero(&peer, len);
 	peer.sin_family = AF_INET;
 	peer.sin_port = peer_port;
-	if(inet_aton(ip, &peer.sin_addr) == 0)
+	if(inet_aton(ttp_args->ip, &peer.sin_addr) == 0)
 	{
 		bf_log(  "Failed to read in ip address of the peer.\n");
 		rv = -1;
@@ -359,11 +508,12 @@ int talk_to_peer(uint8_t *info_hash, uint8_t *our_peer_id, char *ip, uint16_t po
 		bf_log("[LOG] rv from receive_msg: %d.\n", rv);
         	if(rv == RECV_ERROR)
         	{
+			rv = -1;
                 	goto cleanup;
         	}
 		if(rv == RECV_TO)
 		{
-			rv = 0;
+			rv = -1;
 			goto cleanup;
 		}
 
@@ -382,6 +532,8 @@ int talk_to_peer(uint8_t *info_hash, uint8_t *our_peer_id, char *ip, uint16_t po
 	rv = get_pieces(socketfd, &peer_status);
 
 cleanup:
+	bf_log(" ------------------------------------ FINISH: TALK_TO_PEER  ----------------------------------------\n");	
+
 	bf_log("[LOG] In cleanup.\n");
 	if(socketfd > 0)
 	{
@@ -400,7 +552,7 @@ cleanup:
 		free(recvd_msg);
                 recvd_msg = NULL;
         }
-	return rv;
+	return (void *)rv;
 }
 
 int receive_msg_hs(int socketfd, fd_set *recvfd, uint8_t **msg, int *len)
@@ -694,10 +846,36 @@ cleanup:
 int get_pieces(int socketfd, struct pwp_peer *peer)
 {
 	bf_log("++++++++++++++++++++ START:  GET_PIECES +++++++++++++++++++++++\n");
-	int idx = choose_random_piece_idx();
+
+	int idx = choose_random_piece_idx(peer->peer_id);
+	// TODO: if no piece index is found then idx will be -1. handle that by simply logging and returning.
+	
+	/*-X-X-X- CRITICAL REGION START -X-X-X-  */
+	pthread_mutex_lock(&g_pieces_mutexes[idx]);
+
+	g_pieces[idx].status = PIECE_STATUS_STARTED;
+
+	pthread_mutex_unlock(&g_pieces_mutexes[idx]);
+	/*-X-X-X- CRITICAL REGION END -X-X-X-*/
+
 	bf_log("[LOG] Chose random piece index: %d\n", idx);
 	int rv = download_piece(idx, socketfd, peer);
 
+	/* -X-X-X- CRITICAL REGION START -X-X-X- */
+	pthread_mutex_lock(&g_pieces_mutexes[idx]);
+
+	if(rv == 0)
+	{
+		g_pieces[idx].status = PIECE_STATUS_COMPLETE;
+	}
+	else
+	{
+		g_pieces[idx].status = PIECE_STATUS_AVAILABLE;
+	}
+
+	pthread_mutex_unlock(&g_pieces_mutexes[idx]);
+	/* -X-X-X- CRITICAL REGION END -X-X-X- */
+	
 	bf_log("---------------------------------------- FINISH:  GET_PIECES----------------------------------------\n");
 	return rv;	
 }
@@ -724,9 +902,11 @@ int download_piece(int idx, int socketfd, struct pwp_peer *peer)
 	int i, len, rv;
 	uint8_t *requests;
 	struct pwp_block received_block;
+
+	rv = 0;
 // No 1 above:
-	int num_of_blocks = piece_length / BLOCK_LEN;
-	int bytes_in_last_block = piece_length % BLOCK_LEN;
+	int num_of_blocks = g_piece_length / BLOCK_LEN;
+	int bytes_in_last_block = g_piece_length % BLOCK_LEN;
 
 	if(bytes_in_last_block)
 	{
@@ -777,6 +957,14 @@ int download_piece(int idx, int socketfd, struct pwp_peer *peer)
 		requests = prepare_requests(idx, blocks, num_of_blocks, 1, &len);
 	}
 
+	/* -X-X-X- CRITICAL REGION START -X-X-X- */
+	pthread_mutex_lock(&g_downloaded_pieces_mutex);
+
+	g_downloaded_pieces++;
+
+	pthread_mutex_unlock(&g_downloaded_pieces_mutex);
+	/* -X-X-X- CRITICAL REGION END -X-X-X- */
+
 	bf_log("[LOG] *-*-*-*- Downloaded piece!!\n");
 // TODO: verify the piece sha1
 	
@@ -787,7 +975,7 @@ cleanup:
 	{
 		free(requests);
 	}
-	return 0;
+	return rv;
 } 
 
 int download_block(int socketfd, int expected_piece_idx, struct pwp_block *block, struct pwp_peer *peer)
@@ -806,6 +994,7 @@ int download_block(int socketfd, int expected_piece_idx, struct pwp_block *block
 	FD_SET(socketfd, &recvfd);
 	msg = malloc(MAX_DATA_LEN);
 	// NOTE: cannot call receive_msg method above because piece msg will be too long to hold in memory.
+	// TODO: create separate method that handles this scenario as well as receive_msg.
 	while(msg_id != PIECE_MSG_ID)
 	{
 		bf_log("[LOG] Going to get length of message. calling receive_msg_for_len().\n");
@@ -888,7 +1077,12 @@ int download_block(int socketfd, int expected_piece_idx, struct pwp_block *block
 	block->offset = block_offset;
 	bf_log("[LOG] *-*-*- Going to receive piece_idx: %d, block_offset: %d, block length: %d.\n", piece_idx, block_offset, remaining);
 
-	fseek(savedfp, (piece_idx * piece_length) + block_offset, SEEK_SET);
+	/* -X-X-X- CRITICAL REGION START (for saved file) -X-X-X- */
+	// TODO: it is possible to remove this critical region and have a separate file for each piece.
+	//	then no locking is used but we need to merge those pieces into a single file after all have been downloaded.
+	pthread_mutex_lock(&g_savedfp_mutex);
+
+	fseek(g_savedfp, (piece_idx * g_piece_length) + block_offset, SEEK_SET);
 	len = 512; //use len as buffer for following loop	
 
 	int bytes_saved = 0;
@@ -906,11 +1100,15 @@ int download_block(int socketfd, int expected_piece_idx, struct pwp_block *block
 			rv = RECV_ERROR;
         	        goto cleanup;
 	        }
-	        fwrite(msg, 1, len, savedfp);
+	        fwrite(msg, 1, len, g_savedfp);
 
 		remaining -= len;
 		bytes_saved += len;
 	}
+
+	pthread_mutex_unlock(&g_savedfp_mutex);
+	/* -X-X-X- CRITICAL REGION END (for saved file) -X-X-X- */
+
 	// if here then the block must have been successfully downloaded. update the block struct.
 	block->status = BLOCK_STATUS_DOWNLOADED;
 
@@ -1004,17 +1202,18 @@ int process_bitfield(uint8_t *msg, struct pwp_peer *peer)
             if(bits & mask)
             {
                 idx = i*8 + j;
-                if(idx >= num_of_pieces)
+                if(idx >= g_num_of_pieces)
                 {
                     bf_log(  "[ERROR] Bitfield has more bits set than there are number of pieces.\n");
                     rv = -1;
                     // TODO: Reset all pieces that were set to available for this particular peer.
                     goto cleanup;
                 }
-                if(pieces[idx].status == PIECE_STATUS_NOT_AVAILABLE)
+                if(g_pieces[idx].status != PIECE_STATUS_COMPLETE)
                 {
-                    pieces[idx].status = PIECE_STATUS_AVAILABLE;
-                    pieces[idx].peer = peer;
+                    g_pieces[idx].status = PIECE_STATUS_AVAILABLE;
+		
+		    linked_list_add(&g_pieces[idx].peers, peer);	
                 }
             }
             mask = mask / 2;
@@ -1033,17 +1232,17 @@ int process_have(uint8_t *msg, struct pwp_peer *peer)
     uint8_t *curr = msg;
     int idx = ntohl((int)(*(curr+5)));
       
-    if(pieces[idx].status == PIECE_STATUS_NOT_AVAILABLE)
+    if(g_pieces[idx].status != PIECE_STATUS_COMPLETE)
     {
-        pieces[idx].status = PIECE_STATUS_AVAILABLE;
-        pieces[idx].peer = peer;
+        g_pieces[idx].status = PIECE_STATUS_AVAILABLE;
+        linked_list_add(&g_pieces[idx].peers, peer);
     }
 
 	bf_log("---------------------------------------- FINISH:  PROCESS_HAVE ----------------------------------------\n");
     return rv;
 } 
 
-int choose_random_piece_idx()
+int choose_random_piece_idx(uint8_t *peer_id)
 {
 	bf_log("++++++++++++++++++++ START:  CHOOSE_RANDOM_PIECE_IDX +++++++++++++++++++++++\n");
     int i, r, random_piece_idx;
@@ -1053,27 +1252,124 @@ int choose_random_piece_idx()
       
     for(i=0; i<10; i++) // 10 attempts at getting a random available piece
     {
-        r = rand() % num_of_pieces;
-        if(pieces[r].status == PIECE_STATUS_AVAILABLE)
+        r = rand() % g_num_of_pieces;
+	/*-X-X-X- START OF CRITICAL REGION  -X-X-X-*/
+	pthread_mutex_lock(&g_pieces_mutexes[r]);
+
+        if(linked_list_contains_peer_id(g_pieces[r].peers, peer_id) && (g_pieces[r].status == PIECE_STATUS_AVAILABLE))
         {
             random_piece_idx = r;
+	    pthread_mutex_unlock(&g_pieces_mutexes[r]);
             break;
         }
+
+	pthread_mutex_unlock(&g_pieces_mutexes[r]);
+	/*-X-X-X- END OF CRITICAL REGION  -X-X-X-*/
     }
       
     // if no piece found after random attempts then go sequentially
     if(random_piece_idx == -1)
     {
-        for(i=0; i<num_of_pieces; i++)
+        for(i=0; i<g_num_of_pieces; i++)
         {
-            if(pieces[i].status == PIECE_STATUS_AVAILABLE)
+	    /*-X-X-X- START OF CRITICAL REGION  -X-X-X-*/
+            pthread_mutex_lock(&g_pieces_mutexes[i]);
+         
+	   if(linked_list_contains_peer_id(g_pieces[i].peers, peer_id) && (g_pieces[i].status == PIECE_STATUS_AVAILABLE))
             {
                 random_piece_idx = i;
+		pthread_mutex_unlock(&g_pieces_mutexes[i]);
                 break;
             }
+	   pthread_mutex_unlock(&g_pieces_mutexes[i]);
+           /*-X-X-X- END OF CRITICAL REGION  -X-X-X-*/
         }
     }
       
 	bf_log("---------------------------------------- FINISH:  CHOOSE_RANDOM_PIECE_IDX  ----------------------------------------\n");
     return random_piece_idx;
+}
+
+int are_same_peers(uint8_t *peer_id1, uint8_t *peer_id2)
+{
+	// TODO: perform bounds checking
+//	bf_log("++++++++++++++++++++ START:  ARE_SAME_PEERS +++++++++++++++++++++++\n");
+
+	int rv = 1; // default: are same peers
+	int i;
+	
+	for(i=0; i<20; i++)
+	{
+		if(peer_id1[i] != peer_id2[i])
+		{
+//			bf_log("[LOG] are_same_peers(): peers are not the same.\n");
+			rv = 0;
+			break;
+		}
+	}
+
+cleanup:
+//	bf_log("---------------------------------------- FINISH:  ARE_SAME_PEERS ----------------------------------------\n");
+	return rv;
+}
+
+void linked_list_add(struct pwp_peer_node **head, struct pwp_peer *peer)
+{
+//	bf_log("++++++++++++++++++++ START:  LINKED_LIST_ADD +++++++++++++++++++++++\n");
+	// special case of head being null
+	if(*head == NULL)
+	{
+		*head = malloc(sizeof(struct pwp_peer_node));
+		(*head)->peer = peer;
+		(*head)->next = NULL;
+		return;
+	}
+
+	// if here then head must not be null
+	struct pwp_peer_node *curr = *head;
+
+	while(curr->next != NULL)
+	{
+		curr = curr->next;
+	}
+	curr->next = malloc(sizeof(struct pwp_peer_node));
+	curr = curr->next;
+	curr->peer = peer;
+	curr->next = NULL;
+//	bf_log("---------------------------------------- FINISH:  LINKED_LIST_ADD ----------------------------------------\n");
+}
+
+int linked_list_contains_peer_id(struct pwp_peer_node *head, uint8_t *peer_id)
+{
+//	bf_log("++++++++++++++++++++ START:  LINKED_LIST_CONTAINS_PEER_ID +++++++++++++++++++++++\n");
+	int rv = 0;
+
+	while(head)
+	{
+		if(are_same_peers(head->peer->peer_id, peer_id))
+		{
+			rv = 1;
+			break;
+		}
+	}
+
+//	bf_log("---------------------------------------- FINISH:  LINKED_LIST_CONTAINS_PEER_ID ----------------------------------------\n");
+	return rv;
+}
+
+void linked_list_free(struct pwp_peer_node **head)
+{
+//	bf_log("++++++++++++++++++++ START:  LINKED_LIST_FREE +++++++++++++++++++++++\n");
+        
+	struct pwp_peer_node *curr, *temp;
+	curr = *head;
+	while(curr)
+	{
+		temp = curr;
+		curr = curr->next;
+		free(temp);
+	}
+	*head = NULL;
+
+//        bf_log("---------------------------------------- FINISH:  LINKED_LIST_FREE ----------------------------------------\n");
 }
